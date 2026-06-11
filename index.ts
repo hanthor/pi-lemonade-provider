@@ -73,18 +73,16 @@ const NON_CHAT_LABELS = new Set([
   "chat-transcription", // omni audio (skip — audio endpoint only)
 ]);
 
-/** Default context windows per rough model size bracket. */
+/** Default context windows per rough model size bracket.
+ *  Note: Lemonade Server defaults to ctx_size=4096 (configurable via
+ *  LEMONADE_CTX_SIZE env var on the server). We use 4096 as a safe
+ *  default and use the model's max_context_window when available. */
 const DEFAULT_CTX: Record<string, number> = {
-  // Tiny (< 1 GB)
-  tiny: 8192,
-  // Small (1-3 GB)
-  small: 32768,
-  // Medium (3-10 GB)
-  medium: 131072,
-  // Large (10-30 GB)
-  large: 131072,
-  // XLarge (> 30 GB)
-  xlarge: 262144,
+  tiny: 4096,
+  small: 4096,
+  medium: 4096,
+  large: 4096,
+  xlarge: 4096,
 };
 
 /** Default max output tokens per model size bracket. */
@@ -93,6 +91,15 @@ const DEFAULT_MAX_TOKENS: Record<string, number> = {
   small: 8192,
   medium: 16384,
   large: 32768,
+  xlarge: 65536,
+};
+
+/** Max tokens for reasoning models — doubled since they spend tokens thinking. */
+const REASONING_MAX_TOKENS: Record<string, number> = {
+  tiny: 8192,
+  small: 16384,
+  medium: 32768,
+  large: 65536,
   xlarge: 65536,
 };
 
@@ -266,6 +273,11 @@ interface ProviderModel {
     cacheRead: number;
     cacheWrite: number;
   };
+  compat?: {
+    thinkingFormat?: string;
+    supportsDeveloperRole?: boolean;
+    supportsReasoningEffort?: boolean;
+  };
 }
 
 /** Map a Lemonade model entry to a pi provider model definition. */
@@ -277,8 +289,10 @@ function mapModel(entry: LemonadeModelEntry): ProviderModel {
   const hasReasoning = entry.labels.includes("reasoning");
 
   const contextWindow =
-    entry.max_context_window ?? DEFAULT_CTX[bracket] ?? 131072;
-  const maxTokens = DEFAULT_MAX_TOKENS[bracket] ?? 16384;
+    entry.max_context_window ?? DEFAULT_CTX[bracket] ?? 4096;
+  const maxTokens = hasReasoning
+    ? (REASONING_MAX_TOKENS[bracket] ?? 32768)
+    : (DEFAULT_MAX_TOKENS[bracket] ?? 16384);
 
   // Build a human-readable name with size info and labels
   const sizeStr = sizeGb >= 1 ? `${sizeGb.toFixed(1)} GB` : `${(sizeGb * 1024).toFixed(0)} MB`;
@@ -291,14 +305,26 @@ function mapModel(entry: LemonadeModelEntry): ProviderModel {
     name = `${entry.id} (${labelHints})`;
   }
 
+  // Reasoning models: enable deepseek thinking format so pi parses
+  // reasoning_content streams and sends thinking: { type: "enabled" }.
+  // Provider-level compat already sets supportsDeveloperRole: false and
+  // supportsReasoningEffort: false, so they won't interfere.
+  let compat: ProviderModel["compat"] | undefined;
+  if (hasReasoning) {
+    compat = {
+      thinkingFormat: "deepseek",
+    };
+  }
+
   return {
-    id: `lemonade/${entry.id}`,
+    id: entry.id,
     name,
     reasoning: hasReasoning,
     input: hasVision ? ["text", "image"] : ["text"],
     contextWindow,
     maxTokens,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    ...(compat ? { compat } : {}),
   };
 }
 
@@ -392,5 +418,27 @@ export default async function (pi: ExtensionAPI) {
       `Lemonade${ver} @ ${server.host}:${server.port} — ${chatModels.length} chat models (${reasoningCount} reasoning, ${visionCount} vision) from ${totalFound} total`,
       "info"
     );
+  });
+
+  // ── Rewrite Lemonade context-overflow errors so pi can auto-compact ──
+  // Lemonade returns: {"error":{"code":400,"message":"request (N tokens) exceeds ...","type":"exceed_context_size_error"}}
+  // This is a non-streaming error in a 200 response. pi sees it as a stream
+  // that never produces finish_reason. Normalize to context_length_exceeded.
+  pi.on("message_end", (event, ctx) => {
+    const message = event.message;
+    if (message.role !== "assistant") return;
+    if (message.stopReason !== "error") return;
+    if (message.provider !== "lemonade" && ctx.model?.provider !== "lemonade") return;
+
+    const em = message.errorMessage ?? "";
+    if (em.includes("context_length_exceeded")) return;
+    if (!em.includes("exceeds the available context size")) return;
+
+    return {
+      message: {
+        ...message,
+        errorMessage: `context_length_exceeded: ${em}`,
+      },
+    };
   });
 }

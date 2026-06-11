@@ -77,6 +77,15 @@ Non-chat models (image generation, transcription, embeddings, reranking, TTS) ar
 curl http://localhost:13305/api/version
 ```
 
+**"Stream ended without finish_reason" / context overflow** — pi's system prompt is large. Increase the server's context size:
+
+```bash
+# On the Lemonade Server host, set ctx_size before starting:
+export LEMONADE_CTX_SIZE=32768
+# Or in the k8s Deployment:
+kubectl set env deploy/lemonade LEMONADE_CTX_SIZE=32768
+```
+
 **"failed to fetch models"** — The server is reachable but the `/v1/models` endpoint returned an error. Check server logs.
 
 **Models don't appear** — Models with `downloaded: false` auto-download on first use via Lemonade's `/v1/chat/completions` endpoint. Select a model and send a prompt — Lemonade handles the download transparently.

@@ -1,0 +1,17 @@
+{
+  "name": "pi-lemonade-provider",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "pi extension that auto-discovers a Lemonade Server and registers its chat models",
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

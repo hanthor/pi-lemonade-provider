@@ -344,7 +344,7 @@ export default async function (pi: ExtensionAPI) {
     pi.registerProvider("lemonade", {
       baseUrl: "http://localhost:13305/v1",
       api: "openai-completions",
-      apiKey: "lemonade",
+      apiKey: "$LEMONADE_API_KEY",
       compat: {
         supportsDeveloperRole: false,
         supportsReasoningEffort: false,
@@ -371,7 +371,7 @@ export default async function (pi: ExtensionAPI) {
       name: `Lemonade (${server.host}:${server.port})`,
       baseUrl: server.baseUrl,
       api: "openai-completions",
-      apiKey: "lemonade",
+      apiKey: "$LEMONADE_API_KEY",
       compat: {
         supportsDeveloperRole: false,
         supportsReasoningEffort: false,
@@ -415,7 +415,7 @@ export default async function (pi: ExtensionAPI) {
     name: `Lemonade (${server.host}:${server.port})`,
     baseUrl: server.baseUrl,
     api: "openai-completions",
-    apiKey: "lemonade",
+    apiKey: "$LEMONADE_API_KEY",
     compat: {
       supportsDeveloperRole: false,
       supportsReasoningEffort: false,

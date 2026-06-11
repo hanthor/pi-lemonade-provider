@@ -281,12 +281,13 @@ interface ProviderModel {
 }
 
 /** Map a Lemonade model entry to a pi provider model definition. */
-function mapModel(entry: LemonadeModelEntry): ProviderModel {
+function mapModel(entry: LemonadeModelEntry, downloadStatus: Map<string, boolean>): ProviderModel {
   const sizeGb = parseSizeGb(entry.size);
   const bracket = sizeBracket(sizeGb);
 
   const hasVision = entry.labels.includes("vision");
   const hasReasoning = entry.labels.includes("reasoning");
+  const isDownloaded = downloadStatus.get(entry.id) ?? entry.downloaded;
 
   const contextWindow =
     entry.max_context_window ?? DEFAULT_CTX[bracket] ?? 4096;
@@ -294,16 +295,15 @@ function mapModel(entry: LemonadeModelEntry): ProviderModel {
     ? (REASONING_MAX_TOKENS[bracket] ?? 32768)
     : (DEFAULT_MAX_TOKENS[bracket] ?? 16384);
 
-  // Build a human-readable name with size info and labels
-  const sizeStr = sizeGb >= 1 ? `${sizeGb.toFixed(1)} GB` : `${(sizeGb * 1024).toFixed(0)} MB`;
+  // Build a human-readable name with labels + download status
   const labelHints = entry.labels
     .filter((l) => !NON_CHAT_LABELS.has(l) && l !== "reasoning" && l !== "llamacpp")
     .join(", ");
 
-  let name = entry.id;
-  if (labelHints) {
-    name = `${entry.id} (${labelHints})`;
-  }
+  const extras: string[] = [];
+  if (labelHints) extras.push(labelHints);
+  if (!isDownloaded) extras.push("\u2B07 download needed");
+  const suffix = extras.length > 0 ? ` (${extras.join("; ")})` : "";
 
   // Reasoning models: enable deepseek thinking format so pi parses
   // reasoning_content streams and sends thinking: { type: "enabled" }.
@@ -315,6 +315,8 @@ function mapModel(entry: LemonadeModelEntry): ProviderModel {
       thinkingFormat: "deepseek",
     };
   }
+
+  const name = entry.id + suffix;
 
   return {
     id: entry.id,
@@ -389,14 +391,24 @@ export default async function (pi: ExtensionAPI) {
   // ── Phase 3: Filter and map chat models ──
   const totalFound = rawModels.length;
 
+  // Build download-status lookup
+  const downloadStatus = new Map<string, boolean>();
+  for (const m of rawModels) {
+    downloadStatus.set(m.id, m.downloaded);
+  }
+
   const chatModels = rawModels
     .filter((m) => m.id && !m.id.startsWith("LMX-") && m.id !== "Lite Collection" && m.id !== "Ultra Collection")
     .filter(isChatModel)
     .sort((a, b) => a.id.localeCompare(b.id))
-    .map(mapModel);
+    .map((m) => mapModel(m, downloadStatus));
 
   const reasoningCount = chatModels.filter((m) => m.reasoning).length;
   const visionCount = chatModels.filter((m) => m.input.includes("image")).length;
+  const notDownloadedCount = chatModels.filter((m) => m.name.includes("⬇")).length;
+
+  // ── Track in-progress downloads (model ID → AbortController) ──
+  const activeDownloads = new Map<string, AbortController>();
 
   // ── Phase 4: Register the provider ──
   pi.registerProvider("lemonade", {
@@ -414,10 +426,85 @@ export default async function (pi: ExtensionAPI) {
   // ── Notify on session start ──
   pi.on("session_start", async (_event, ctx) => {
     const ver = server.version ? ` v${server.version}` : "";
+    const dlNote = notDownloadedCount > 0 ? ` (${notDownloadedCount} need download)` : "";
     ctx.ui.notify(
-      `Lemonade${ver} @ ${server.host}:${server.port} — ${chatModels.length} chat models (${reasoningCount} reasoning, ${visionCount} vision) from ${totalFound} total`,
+      `Lemonade${ver} @ ${server.host}:${server.port} — ${chatModels.length} chat models${dlNote}`,
       "info"
     );
+  });
+
+  // ── Auto-download models on selection ──
+  pi.on("model_select", async (event, ctx) => {
+    // Only handle lemonade models
+    if (event.model.provider !== "lemonade") return;
+
+    const modelId = event.model.id;
+    const isDownloaded = downloadStatus.get(modelId) ?? true;
+    if (isDownloaded) {
+      ctx.ui.setWidget("lemonade-dl", null);
+      return;
+    }
+
+    // Already downloading?
+    if (activeDownloads.has(modelId)) return;
+
+    const abort = new AbortController();
+    activeDownloads.set(modelId, abort);
+
+    const baseHost = server.baseUrl.replace(/\/v1\/?$/, "");
+    const modelName = event.model.name ?? modelId;
+
+    try {
+      const resp = await fetch(`${baseHost}/api/pull`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: modelId }),
+        signal: abort.signal,
+      });
+
+      if (!resp.ok || !resp.body) {
+        ctx.ui.setWidget("lemonade-dl", [`Download failed for ${modelName}`]);
+        ctx.ui.notify(`Lemonade: failed to pull ${modelId}`, "error");
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          try {
+            const data = JSON.parse(line.trim());
+            if (data.total && data.completed !== undefined) {
+              const pct = Math.round((data.completed / data.total) * 100);
+              const status = typeof data.status === "string" ? data.status : "";
+              ctx.ui.setWidget("lemonade-dl", [
+                `Downloading ${modelName}: ${pct}%`,
+              ]);
+            }
+          } catch { /* skip unparseable lines */ }
+        }
+      }
+
+      // Mark as downloaded and clear widget
+      downloadStatus.set(modelId, true);
+      ctx.ui.setWidget("lemonade-dl", null);
+      ctx.ui.notify(`Lemonade: ${modelName} ready`, "info");
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === "AbortError") return;
+      const msg = err instanceof Error ? err.message : String(err);
+      ctx.ui.setWidget("lemonade-dl", null);
+      ctx.ui.notify(`Lemonade: download failed — ${msg}`, "error");
+    } finally {
+      activeDownloads.delete(modelId);
+    }
   });
 
   // ── Rewrite Lemonade context-overflow errors so pi can auto-compact ──
